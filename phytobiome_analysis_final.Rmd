@@ -1,0 +1,778 @@
+---
+title: "Endophyte Community Analysis: Bacterial (16S) and Fungal (ITS) Communities in Ailanthus before and after Verticillium Inoculation"
+author: "H. Miles"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    df_print: paged
+editor_options:
+  chunk_output_type: console
+---
+
+# Setup and Package Installation
+
+```{r setup, message=FALSE, warning=FALSE}
+# Install packages if not already installed
+install_if_missing <- function(packages, repos = "https://cran.rstudio.com/") {
+  new_packages <- packages[!(packages %in% installed.packages()[,"Package"])]
+  if(length(new_packages)) {
+    install.packages(new_packages, dependencies = TRUE, repos = repos)
+  }
+}
+
+# Install BiocManager first if needed
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager", repos = "https://cran.rstudio.com/")
+}
+
+# Install required CRAN packages
+cran_packages <- c("ape", "dplyr", "ggplot2", "tidyr", "readr",
+                   "vegan", "picante", "lme4", "phangorn", "emmeans",
+                   "lmerTest", "patchwork")
+
+
+install_if_missing(cran_packages)
+
+# Install Bioconductor packages
+library(BiocManager)
+
+bioc_packages <- c("phyloseq")
+for (pkg in bioc_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    BiocManager::install(pkg, update = FALSE, ask = FALSE)
+  }
+}
+
+# Load required libraries
+library(ape)                # for phylogenetic trees 
+library(dplyr)              # for data manipulation
+library(ggplot2)            # for plotting
+library(tidyr)              # for reshaping data
+library(readr)              # for reading files
+ 
+library(phyloseq)           # for microbiome data handling
+library(vegan)              # for ecological statistics
+library(picante)            # for phylogenetic diversity metrics 
+library(lme4)               # for mixed-effects models
+library(phangorn)           # for phylogenetic analysis tools
+library(emmeans)            # for post-hoc comparisons 
+library(lmerTest)           # for p-values in mixed-effects models 
+ 
+library(patchwork)          # for plot composition 
+```
+
+# Bacterial Community Analysis (16S rRNA)
+
+## Data Loading and Processing
+
+```{r load-16s-data}
+cat("Working directory:", getwd(), "\n")
+
+# Load 16S bacterial data
+data_16s <- read.table("../qiime2_exports/16S/_export/feature-table.tsv",
+                      header = TRUE, sep = "\t", row.names = 1,
+                      comment.char = "", check.names = FALSE,
+                      quote = "", skip = 1)
+
+metadata_16s <- read.table("../qiime2_exports/sample-metadata-updated.tsv",
+                          header = TRUE, sep = "\t", row.names = "sample-id",
+                          comment.char = "", check.names = FALSE, quote = "")
+
+colnames(data_16s) <- trimws(colnames(data_16s))
+rownames(metadata_16s) <- sub("\r$", "", trimws(rownames(metadata_16s)))
+
+# Read 16S taxonomy
+taxa_16s <- read.table("../qiime2_exports/16S/_export/taxonomy.tsv",
+                      header = TRUE, sep = "\t", quote = "",
+                      comment.char = "", check.names = FALSE)
+
+# Process 16S taxonomy
+fid_col_16s <- if ("Feature ID" %in% names(taxa_16s)) "Feature ID" else "Feature.ID"
+fid_vec_16s <- taxa_16s[[fid_col_16s]]
+
+tax_strings_16s <- taxa_16s[["Taxon"]]
+tax_strings_16s[is.na(tax_strings_16s)] <- ""
+parts_16s <- strsplit(tax_strings_16s, ";\\s*")
+
+rank_names <- c("Kingdom","Phylum","Class","Order","Family","Genus","Species","Subspecies")
+
+tax_mat_16s <- t(vapply(parts_16s, function(x) {
+  if (length(x) == 1 && (x[1] == "" || x[1] == "NA")) x <- character(0)
+  x <- sub("^[dkpcofgs]__", "", x)
+  if (length(x) >= 8) x <- x[1:8]
+  if (length(x) < 8) x <- c(x, rep(NA_character_, 8 - length(x)))
+  x
+}, FUN.VALUE = character(8), USE.NAMES = FALSE))
+
+colnames(tax_mat_16s) <- rank_names
+rownames(tax_mat_16s) <- fid_vec_16s
+
+taxa_16s_final <- as.data.frame(tax_mat_16s, stringsAsFactors = FALSE)
+taxa_16s_final <- taxa_16s_final[rownames(data_16s), , drop = FALSE]
+
+# Load and process 16S phylogenetic tree
+tree_16s <- read.tree("../qiime2_exports/16S/_export/tree.nwk")
+tree_16s <- root(tree_16s, 1, resolve.root = T)
+```
+
+## Create 16S Phyloseq Object
+
+```{r create-16s-phyloseq}
+# Create 16S phyloseq object
+PO_16s <- merge_phyloseq(
+  otu_table(as.matrix(data_16s), taxa_are_rows = TRUE),
+  sample_data(metadata_16s),
+  tax_table(as.matrix(taxa_16s_final)),
+  phy_tree(tree_16s)
+)
+
+cat("16S phyloseq object created with", nsamples(PO_16s), "samples and", ntaxa(PO_16s), "taxa\n")
+
+# Filter data
+PO_16s <- subset_samples(PO_16s, Treatment %in% c("Control", "VnAa140"))
+PO_16s <- prune_samples(sample_sums(PO_16s) >= 1000, PO_16s)
+PO_16s <- filter_taxa(PO_16s, function(x) {sum(x > 0) > 1}, prune = TRUE)
+
+cat("After filtering: 16S has", nsamples(PO_16s), "samples and", ntaxa(PO_16s), "taxa\n")
+```
+
+## 16S Diversity Analysis
+
+```{r 16s-statistics}
+# Prepare 16S phylogenetic tree for analysis
+sampledf_16s <- data.frame(sample_data(PO_16s))
+tr_16s <- phy_tree(PO_16s)
+tr_16s <- ape::reorder.phylo(tr_16s, "postorder")
+tr_16s <- ape::multi2di(tr_16s)
+if (!ape::is.rooted(tr_16s)) {
+  tr_16s <- phangorn::midpoint(tr_16s)
+}
+tr_16s$edge.length[is.na(tr_16s$edge.length) | tr_16s$edge.length <= 0] <- 1e-8
+phy_tree(PO_16s) <- tr_16s
+
+# PERMANOVA for 16S bacterial communities
+dist.mat_16s <- phyloseq::distance(PO_16s, method = "unifrac")
+
+set.seed(100)
+perm_16s <- how(nperm = 999)
+setBlocks(perm_16s) <- sampledf_16s$Tree
+pmv_16s <- adonis2(dist.mat_16s ~ Treatment * Timepoint,
+                   data = sampledf_16s, permutations = perm_16s, by = "margin")
+
+print(pmv_16s)
+```
+
+```{r 16s-diversity}
+# Calculate diversity metrics for 16S
+comm.pd_16s <- pd(t(as.data.frame(otu_table(PO_16s))), phy_tree(PO_16s), include.root = TRUE)
+diversity_16s <- estimate_richness(PO_16s, measures = c("Observed","Shannon","Simpson"))
+div2_16s <- cbind(sample_data(PO_16s), diversity_16s)
+div2_16s <- cbind(div2_16s, comm.pd_16s)
+div2_16s$Evenness <- div2_16s$Shannon/log(div2_16s$Observed)
+
+# Update factor levels for legend labels
+div2_16s$Timepoint <- factor(div2_16s$Timepoint, levels = c("Pre", "Post"),
+                            labels = c("Pre-Inoculation", "Post-Inoculation"))
+
+# Mixed-effects models for 16S diversity
+modelPD_16s <- lmer(PD ~ Treatment * Timepoint + (1 | Tree), data = div2_16s)
+modelShannon_16s <- lmer(Shannon ~ Treatment * Timepoint + (1 | Tree), data = div2_16s)
+modelSimpson_16s <- lmer(Simpson ~ Treatment * Timepoint + (1 | Tree), data = div2_16s)
+
+anova_pd_16s <- anova(modelPD_16s)
+print(anova_pd_16s)
+
+# Calculate effect size (eta-squared) for significant treatment effect
+if(anova_pd_16s$`Pr(>F)`[1] < 0.05) {
+  ss_total <- sum(anova_pd_16s$`Sum Sq`)
+  eta_sq <- anova_pd_16s$`Sum Sq`[1] / ss_total
+  cat("Effect size for Treatment main effect (η²):", round(eta_sq, 3), "\n")
+}
+# Post-hoc comparisons for Faith's PD
+print(emmeans(modelPD_16s, list(pairwise ~ Treatment * Timepoint), adjust = "tukey"))
+
+print(anova(modelShannon_16s))
+print(anova(modelSimpson_16s))
+```
+
+# Fungal Community Analysis (ITS)
+
+## ITS Data Loading and Processing
+
+```{r load-its-data}
+
+# Load ITS fungal data
+data_its <- read.table("../qiime2_exports/ITS/_export/feature-table.tsv",
+                      header = TRUE, sep = "\t", row.names = 1,
+                      comment.char = "", check.names = FALSE,
+                      quote = "", skip = 1)
+
+metadata_its <- read.table("../qiime2_exports/sample-metadata-updated.tsv",
+                          header = TRUE, sep = "\t", row.names = "sample-id",
+                          comment.char = "", check.names = FALSE, quote = "")
+
+colnames(data_its) <- trimws(colnames(data_its))
+rownames(metadata_its) <- sub("\r$", "", trimws(rownames(metadata_its)))
+
+# Read ITS taxonomy
+taxa_its <- read.table("../qiime2_exports/ITS/_export/taxonomy.tsv",
+                      header = TRUE, sep = "\t", quote = "",
+                      comment.char = "", check.names = FALSE)
+
+# Process ITS taxonomy (same processing as 16S)
+fid_col_its <- if ("Feature ID" %in% names(taxa_its)) "Feature ID" else "Feature.ID"
+fid_vec_its <- taxa_its[[fid_col_its]]
+
+tax_strings_its <- taxa_its[["Taxon"]]
+tax_strings_its[is.na(tax_strings_its)] <- ""
+parts_its <- strsplit(tax_strings_its, ";\\s*")
+
+tax_mat_its <- t(vapply(parts_its, function(x) {
+  if (length(x) == 1 && (x[1] == "" || x[1] == "NA")) x <- character(0)
+  x <- sub("^[dkpcofgs]__", "", x)
+  if (length(x) >= 8) x <- x[1:8]
+  if (length(x) < 8) x <- c(x, rep(NA_character_, 8 - length(x)))
+  x
+}, FUN.VALUE = character(8), USE.NAMES = FALSE))
+
+colnames(tax_mat_its) <- rank_names
+rownames(tax_mat_its) <- fid_vec_its
+
+taxa_its_final <- as.data.frame(tax_mat_its, stringsAsFactors = FALSE)
+taxa_its_final <- taxa_its_final[rownames(data_its), , drop = FALSE]
+
+# Load ITS phylogenetic tree (generated by QIIME2)
+tree_its <- read.tree("../qiime2_exports/ITS/_export/tree.nwk")
+tree_its <- root(tree_its, 1, resolve.root = TRUE)
+
+```
+
+## Create ITS Phyloseq Object
+
+```{r create-its-phyloseq}
+# Create ITS phyloseq object
+PO_its <- merge_phyloseq(
+  otu_table(as.matrix(data_its), taxa_are_rows = TRUE),
+  sample_data(metadata_its),
+  tax_table(as.matrix(taxa_its_final)),
+  phy_tree(tree_its)
+)
+
+cat("ITS phyloseq object created with", nsamples(PO_its), "samples and", ntaxa(PO_its), "taxa\n")
+
+# Filter data
+PO_its <- subset_samples(PO_its, Treatment %in% c("Control", "VnAa140"))
+PO_its <- prune_samples(sample_sums(PO_its) >= 1000, PO_its)
+PO_its <- filter_taxa(PO_its, function(x) {sum(x > 0) > 1}, prune = TRUE)
+
+cat("After filtering: ITS has", nsamples(PO_its), "samples and", ntaxa(PO_its), "taxa\n")
+```
+
+## ITS Statistical Analysis
+
+```{r its-statistics}
+# PERMANOVA for ITS fungal communities (UniFrac)
+sampledf_its <- data.frame(sample_data(PO_its))
+dist.mat_its <- phyloseq::distance(PO_its, method = "unifrac")
+
+set.seed(100)
+perm_its <- how(nperm = 999)
+setBlocks(perm_its) <- sampledf_its$Tree
+pmv_its <- adonis2(dist.mat_its ~ Treatment * Timepoint,
+                   data = sampledf_its, permutations = perm_its, by = "margin")
+
+print(pmv_its)
+```
+
+## ITS Diversity Analysis
+
+```{r its-diversity}
+# Calculate diversity metrics for ITS including phylogenetic diversity
+comm.pd_its <- pd(t(as.data.frame(otu_table(PO_its))), phy_tree(PO_its), include.root = TRUE)
+diversity_its <- estimate_richness(PO_its, measures = c("Observed","Shannon","Simpson"))
+div2_its <- cbind(sample_data(PO_its), diversity_its)
+div2_its <- cbind(div2_its, comm.pd_its)
+div2_its$Evenness <- div2_its$Shannon/log(div2_its$Observed)
+
+# Update factor levels for consistent legend labels
+div2_its$Timepoint <- factor(div2_its$Timepoint, levels = c("Pre", "Post"),
+                            labels = c("Pre-Inoculation", "Post-Inoculation"))
+
+# Mixed-effects models for ITS diversity
+modelPD_its <- lmer(PD ~ Treatment * Timepoint + (1 | Tree), data = div2_its)
+modelShannon_its <- lmer(Shannon ~ Treatment * Timepoint + (1 | Tree), data = div2_its)
+modelSimpson_its <- lmer(Simpson ~ Treatment * Timepoint + (1 | Tree), data = div2_its)
+
+print(anova(modelPD_its))
+print(anova(modelShannon_its))
+print(anova(modelSimpson_its))
+```
+
+# Figures
+
+## Faith's Phylogenetic Diversity Plot (Bacterial Communities)
+
+```{r faith-pd-plot}
+# Faith's PD plot for bacterial communities (primary result)
+phylogenetic_plot_pd <- ggplot(div2_16s, aes(x = Treatment, y = PD, fill = Timepoint)) +
+  geom_boxplot(outlier.colour = "black", notch = FALSE, outlier.shape = NA) +
+  labs(y = "Faith's Phylogenetic Diversity") +
+  theme_bw(base_size = 12) +
+  theme(
+    axis.title.x = element_blank(),
+    axis.text.x = element_text(color = "black"),
+    axis.text.y = element_text(color = "black"),
+    panel.grid = element_blank(),
+    legend.position = "right",
+    legend.background = element_rect(color = "black", size = 0.3, linetype = "solid"),
+    legend.text = element_text(size = 12),
+    panel.background = element_rect(size = 0.5, linetype = "solid")
+  )
+
+# Add significance brackets with letter labels for Treatment groups
+phylogenetic_plot_pd_with_sig <- phylogenetic_plot_pd +
+  # Control group bracket (labeled "a")
+  annotate("segment", x = 0.7, xend = 1.3, y = 44, yend = 44, linewidth = 0.8) +     # Control horizontal line
+  annotate("segment", x = 0.7, xend = 0.7, y = 43, yend = 44, linewidth = 0.8) +     # Control left vertical
+  annotate("segment", x = 1.3, xend = 1.3, y = 43, yend = 44, linewidth = 0.8) +     # Control right vertical
+  annotate("text", x = 1.0, y = 45.5, label = "a", size = 4) +                       # Control label
+  # VnAa140 group bracket (labeled "b")
+  annotate("segment", x = 1.7, xend = 2.3, y = 36, yend = 36, linewidth = 0.8) +     # VnAa140 horizontal line
+  annotate("segment", x = 1.7, xend = 1.7, y = 35, yend = 36, linewidth = 0.8) +     # VnAa140 left vertical
+  annotate("segment", x = 2.3, xend = 2.3, y = 35, yend = 36, linewidth = 0.8) +     # VnAa140 right vertical
+  annotate("text", x = 2.0, y = 37.5, label = "b", size = 4) +                       # VnAa140 label
+  coord_cartesian(clip = "off")
+
+phylogenetic_plot_pd_with_sig
+
+# Export Faith's PD plot with significance asterisks to parent directory
+ggsave("../Faith_PD_bacterial_diversity.png", plot = phylogenetic_plot_pd_with_sig,
+       width = 8, height = 6, dpi = 300, bg = "white")
+
+
+```
+
+## Combined Diversity Panels
+
+```{r combined-diversity-panels}
+# Create combined diversity plot for bacterial communities (16S)
+faith_plot <- ggplot(div2_16s, aes(x = Treatment, y = PD, fill = Timepoint, alpha = Timepoint)) +
+  geom_boxplot(outlier.colour = "black", notch = FALSE, outlier.shape = NA, show.legend = FALSE) +
+  labs(y = "Faith's Phylogenetic Diversity") +
+  theme_bw(base_size = 10) +
+  theme(
+    axis.title.x = element_blank(),
+    legend.position = "none"
+  ) +
+  scale_fill_discrete(labels = c("Pre-Inoculation", "Post-Inoculation")) +
+  scale_alpha_manual(values = c("Pre-Inoculation" = 0.6, "Post-Inoculation" = 1.0)) +
+  # Add significance brackets with letter labels for Treatment groups
+  # Control group bracket (labeled "a")
+  annotate("segment", x = 0.7, xend = 1.3, y = 44, yend = 44, linewidth = 0.8) +     # Control horizontal line
+  annotate("segment", x = 0.7, xend = 0.7, y = 43, yend = 44, linewidth = 0.8) +     # Control left vertical
+  annotate("segment", x = 1.3, xend = 1.3, y = 43, yend = 44, linewidth = 0.8) +     # Control right vertical
+  annotate("text", x = 1.0, y = 45.5, label = "a", size = 4) +                       # Control label
+  # VnAa140 group bracket (labeled "b")
+  annotate("segment", x = 1.7, xend = 2.3, y = 36, yend = 36, linewidth = 0.8) +     # VnAa140 horizontal line
+  annotate("segment", x = 1.7, xend = 1.7, y = 35, yend = 36, linewidth = 0.8) +     # VnAa140 left vertical
+  annotate("segment", x = 2.3, xend = 2.3, y = 35, yend = 36, linewidth = 0.8) +     # VnAa140 right vertical
+  annotate("text", x = 2.0, y = 37.5, label = "b", size = 4) +                       # VnAa140 label
+  coord_cartesian(clip = "off")
+
+shannon_plot_16s <- ggplot(div2_16s, aes(x = Treatment, y = Shannon, fill = Timepoint, alpha = Timepoint)) +
+  geom_boxplot(outlier.colour = "black", notch = FALSE, outlier.shape = NA, show.legend = FALSE) +
+  labs(y = "Shannon Diversity") +
+  theme_bw(base_size = 10) +
+  theme(
+    axis.title.x = element_blank(),
+    legend.position = "none"
+  ) +
+  scale_fill_discrete(labels = c("Pre-Inoculation", "Post-Inoculation")) +
+  scale_alpha_manual(values = c("Pre-Inoculation" = 0.6, "Post-Inoculation" = 1.0))
+
+simpson_plot_16s <- ggplot(div2_16s, aes(x = Treatment, y = Simpson, fill = Timepoint, alpha = Timepoint)) +
+  geom_boxplot(outlier.colour = "black", notch = FALSE, outlier.shape = NA) +
+  labs(y = "Simpson Diversity") +
+  theme_bw(base_size = 10) +
+  theme(
+    axis.title.x = element_blank(),
+    legend.position = "none"
+  ) +
+  scale_fill_discrete(labels = c("Pre-Inoculation", "Post-Inoculation")) +
+  scale_alpha_manual(values = c("Pre-Inoculation" = 0.6, "Post-Inoculation" = 1.0))
+
+# Combine bacterial diversity plots
+bacterial_diversity_combined <- faith_plot + shannon_plot_16s + simpson_plot_16s +
+  plot_layout(ncol = 3, guides = "collect") +
+  plot_annotation(title = "Bacterial Diversity Indices",
+                  theme = theme(plot.title = element_text(hjust = 0.5))) &
+  theme(legend.position = "bottom")
+
+# Export combined bacterial diversity plot
+ggsave("../Bacterial_Diversity_Combined.png", plot = bacterial_diversity_combined,
+       width = 14, height = 6, dpi = 300, bg = "white")
+
+# Create combined diversity plot for fungal communities (ITS) with all three measures
+faith_plot_its <- ggplot(div2_its, aes(x = Treatment, y = PD, fill = Timepoint, alpha = Timepoint)) +
+  geom_boxplot(outlier.colour = "black", notch = FALSE, outlier.shape = NA) +
+  labs(y = "Faith's Phylogenetic Diversity") +
+  theme_bw(base_size = 10) +
+  theme(
+    axis.title.x = element_blank(),
+    legend.position = "none"
+  ) +
+  scale_fill_discrete(labels = c("Pre-Inoculation", "Post-Inoculation")) +
+  scale_alpha_manual(values = c("Pre-Inoculation" = 0.6, "Post-Inoculation" = 1.0))
+
+shannon_plot_its <- ggplot(div2_its, aes(x = Treatment, y = Shannon, fill = Timepoint, alpha = Timepoint)) +
+  geom_boxplot(outlier.colour = "black", notch = FALSE, outlier.shape = NA) +
+  labs(y = "Shannon Diversity") +
+  theme_bw(base_size = 10) +
+  theme(
+    axis.title.x = element_blank(),
+    legend.position = "none"
+  ) +
+  scale_fill_discrete(labels = c("Pre-Inoculation", "Post-Inoculation")) +
+  scale_alpha_manual(values = c("Pre-Inoculation" = 0.6, "Post-Inoculation" = 1.0))
+
+simpson_plot_its <- ggplot(div2_its, aes(x = Treatment, y = Simpson, fill = Timepoint, alpha = Timepoint)) +
+  geom_boxplot(outlier.colour = "black", notch = FALSE, outlier.shape = NA) +
+  labs(y = "Simpson Diversity") +
+  theme_bw(base_size = 10) +
+  theme(
+    axis.title.x = element_blank(),
+    legend.position = "bottom"
+  ) +
+  scale_fill_discrete(labels = c("Pre-Inoculation", "Post-Inoculation"), name = "Timepoint") +
+  scale_alpha_manual(values = c("Pre-Inoculation" = 0.6, "Post-Inoculation" = 1.0),
+                     labels = c("Pre-Inoculation", "Post-Inoculation"),
+                     name = "Timepoint") +
+  guides(fill = guide_legend(title = "Timepoint"),
+         alpha = guide_legend(title = "Timepoint"))
+
+# Combine fungal diversity plots
+fungal_diversity_combined <- faith_plot_its + shannon_plot_its + simpson_plot_its +
+  plot_layout(ncol = 3) +
+  plot_annotation(title = "Fungal Diversity Indices",
+                  theme = theme(plot.title = element_text(hjust = 0.5)))
+
+# Create one comprehensive diversity panel with embedded titles
+comprehensive_diversity_plot <-
+  # Bacterial row title
+  plot_spacer() +
+  ggplot() + labs(title = "Bacterial Diversity Indices") + theme_void() + theme(plot.title = element_text(hjust = 0.5, size = 14, face = "bold")) +
+  plot_spacer() +
+  # Bacterial diversity plots
+  faith_plot + shannon_plot_16s + simpson_plot_16s +
+  # Fungal row title
+  plot_spacer() +
+  ggplot() + labs(title = "Fungal Diversity Indices") + theme_void() + theme(plot.title = element_text(hjust = 0.5, size = 14, face = "bold")) +
+  plot_spacer() +
+  # Fungal diversity plots
+  faith_plot_its + shannon_plot_its + simpson_plot_its +
+  plot_layout(ncol = 3, heights = c(0.5, 4, 0.5, 4), guides = "collect") &
+  theme(legend.position = "bottom")
+
+print(comprehensive_diversity_plot)
+
+# Export the comprehensive combined diversity plot
+ggsave("../Comprehensive_Diversity_Indices.png", plot = comprehensive_diversity_plot,
+       width = 14, height = 12, dpi = 300, bg = "white")
+
+# Still export individual plots for reference
+print(bacterial_diversity_combined)
+print(fungal_diversity_combined)
+
+# Export individual combined plots
+ggsave("../Bacterial_Diversity_Combined.png", plot = bacterial_diversity_combined,
+       width = 14, height = 6, dpi = 300, bg = "white")
+ggsave("../Fungal_Diversity_Combined.png", plot = fungal_diversity_combined,
+       width = 14, height = 6, dpi = 300, bg = "white")
+```
+
+## Combined NMDS Ordination Plots
+
+```{r combined-nmds-plots}
+# Create NMDS ordinations
+# Both 16S and ITS: unweighted UniFrac distances
+nmds_ord_16s <- ordinate(physeq = PO_16s, method = "NMDS", distance = "unifrac")
+nmds_ord_its <- ordinate(physeq = PO_its, method = "NMDS", distance = "unifrac")
+
+# 16S bacterial NMDS plot
+nmds_plot_bacteria <- plot_ordination(physeq = PO_16s, ordination = nmds_ord_16s,
+                                     axes = c(1,2), color = "Treatment", shape = "Timepoint") +
+  stat_ellipse(
+    aes(x = NMDS1, y = NMDS2,
+        group = Treatment, linetype = Treatment, color = Treatment),
+    level = 0.95, type = "t", show.legend = TRUE, inherit.aes = FALSE
+  ) +
+  coord_equal() + theme_bw() +
+  scale_shape_manual(values = c("Pre" = 16, "Post" = 17),
+                     labels = c("Pre-Inoculation", "Post-Inoculation"),
+                     name = "Timepoint") +
+  guides(shape = guide_legend(override.aes = list(size = 3)))
+
+# ITS fungal NMDS plot
+nmds_plot_fungi <- plot_ordination(physeq = PO_its, ordination = nmds_ord_its,
+                                  axes = c(1,2), color = "Treatment", shape = "Timepoint") +
+  stat_ellipse(
+    aes(x = NMDS1, y = NMDS2,
+        group = Treatment, linetype = Treatment, color = Treatment),
+    level = 0.95, type = "t", show.legend = TRUE, inherit.aes = FALSE
+  ) +
+  coord_equal() + theme_bw() +
+  scale_shape_manual(values = c("Pre" = 16, "Post" = 17),
+                     labels = c("Pre-Inoculation", "Post-Inoculation"),
+                     name = "Timepoint") +
+  guides(shape = guide_legend(override.aes = list(size = 3)))
+
+# Create combined NMDS plot with titles directly on plots
+combined_nmds_plot <-
+  (nmds_plot_bacteria + ggtitle("Bacterial Community") + coord_fixed(ratio = 1) + xlim(-0.8, 0.8) + ylim(-0.5, 0.5) +
+   theme(plot.title = element_text(hjust = 0.5, size = 14, face = "bold"))) +
+  (nmds_plot_fungi + ggtitle("Fungal Community") + coord_fixed(ratio = 1) + xlim(-0.8, 0.8) + ylim(-0.5, 0.5) +
+   theme(plot.title = element_text(hjust = 0.5, size = 14, face = "bold"))) +
+  plot_layout(ncol = 2, guides = "collect") &
+  theme(legend.position = "bottom")
+
+combined_nmds_plot
+
+# Export the combined NMDS plot
+ggsave("../NMDS_Combined_Bacteria_Fungi.png", plot = combined_nmds_plot,
+       width = 14, height = 6, dpi = 300, bg = "white")
+
+# Export individual NMDS plots
+ggsave("../NMDS_Bacterial_16S.png", plot = nmds_plot_bacteria,
+       width = 8, height = 6, dpi = 300, bg = "white")
+ggsave("../NMDS_Fungal_ITS.png", plot = nmds_plot_fungi,
+       width = 8, height = 6, dpi = 300, bg = "white")
+```
+
+## Taxonomic Composition Analysis
+
+```{r taxonomic-composition}
+# Function to build genus table
+build_genus_table <- function(ft_path, tax_path, n_top = 15) {
+  ft <- read_tsv(ft_path, comment = "#", show_col_types = FALSE)
+  tax <- read_tsv(tax_path, show_col_types = FALSE)
+
+  names(ft)[1]  <- "FeatureID"
+  names(tax)[1] <- "FeatureID"
+
+  dat <- ft %>%
+    pivot_longer(-FeatureID, names_to = "SampleID", values_to = "Abundance") %>%
+    left_join(tax, by = "FeatureID")
+
+  # Fixed genus extraction - handle semicolon separators (not dots)
+  dat$Genus <- sub(".*;g__", "", dat$Taxon)
+  dat$Genus <- sub(";s__.*$", "", dat$Genus)  # Remove ;s__ and everything after (correct separator)
+
+  # Replace numeric/placeholder genus identifiers with proper taxonomic names
+  dat$Genus[dat$Genus == "1174-901-12"] <- "Beijerinckiaceae_gen_incertae_sedis"
+
+  dat$Genus[dat$Genus == "" | dat$Genus == dat$Taxon] <- "Unassigned"
+
+  genus_sum <- dat %>%
+    group_by(SampleID, Genus) %>%
+    summarise(Abundance = sum(Abundance), .groups = "drop") %>%
+    filter(Genus != "Unassigned") %>%
+    group_by(SampleID) %>%
+    mutate(RelAbundance = 100 * Abundance / sum(Abundance)) %>%
+    ungroup()
+
+  # Get top genera by mean abundance
+  top_genera_summary <- genus_sum %>%
+    group_by(Genus) %>%
+    summarize(mean_rel = mean(RelAbundance, na.rm = TRUE), .groups = "drop") %>%
+    arrange(desc(mean_rel)) %>%
+    slice_head(n = n_top)
+
+  return(top_genera_summary)
+}
+
+# Build genus data for both datasets
+top_bacteria <- build_genus_table("../qiime2_exports/16S/_export/feature-table.tsv",
+                                  "../qiime2_exports/16S/_export/taxonomy.tsv")
+
+top_fungi <- build_genus_table("../qiime2_exports/ITS/_export/feature-table.tsv",
+                               "../qiime2_exports/ITS/_export/taxonomy.tsv")
+
+# Display the data tables first to see what we're working with
+print(top_bacteria)
+print(top_fungi)
+
+# Create horizontal bar charts with values on bars
+p_bacteria_clean <- ggplot(top_bacteria, aes(x = reorder(Genus, mean_rel), y = mean_rel)) +
+  geom_col(fill = "steelblue", alpha = 0.7) +
+  geom_text(aes(label = round(mean_rel, 2)), hjust = -0.1, size = 3) +
+  coord_flip() +
+  theme_bw() +
+  labs(
+    x = "Genus",
+    y = "Mean relative abundance (%)",
+    title = "Top 15 Bacterial Genera (16S)"
+  ) +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(size = 14, face = "bold")
+  ) +
+  expand_limits(y = max(top_bacteria$mean_rel) * 1.15)
+
+p_fungi_clean <- ggplot(top_fungi, aes(x = reorder(Genus, mean_rel), y = mean_rel)) +
+  geom_col(fill = "darkgreen", alpha = 0.7) +
+  geom_text(aes(label = round(mean_rel, 2)), hjust = -0.1, size = 3) +
+  coord_flip() +
+  theme_bw() +
+  labs(
+    x = "Genus",
+    y = "Mean relative abundance (%)",
+    title = "Top 15 Fungal Genera (ITS)"
+  ) +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(size = 14, face = "bold")
+  ) +
+  expand_limits(y = max(top_fungi$mean_rel) * 1.15)
+
+# Display and export the plots
+print(p_bacteria_clean)
+print(p_fungi_clean)
+
+ggsave("../Top_15_Bacterial_Genera_16S.png", plot = p_bacteria_clean,
+       width = 10, height = 8, dpi = 300, bg = "white")
+
+ggsave("../Top_15_Fungal_Genera_ITS.png", plot = p_fungi_clean,
+       width = 10, height = 8, dpi = 300, bg = "white")
+```
+
+# Descriptive Statistics
+
+## Treatment and Timepoint Summary Statistics
+
+```{r treatment-effects-summary}
+pd_summary_16s <- div2_16s %>%
+  group_by(Treatment, Timepoint) %>%
+  summarise(
+    n = n(),
+    mean_PD = round(mean(PD, na.rm = TRUE), 2),
+    sd_PD = round(sd(PD, na.rm = TRUE), 2),
+    median_PD = round(median(PD, na.rm = TRUE), 2),
+    min_PD = round(min(PD, na.rm = TRUE), 2),
+    max_PD = round(max(PD, na.rm = TRUE), 2),
+    se_PD = round(sd(PD, na.rm = TRUE) / sqrt(n()), 2),
+    ci_lower = round(mean(PD, na.rm = TRUE) - (1.96 * se_PD), 2),
+    ci_upper = round(mean(PD, na.rm = TRUE) + (1.96 * se_PD), 2),
+    .groups = 'drop'
+  )
+
+knitr::kable(pd_summary_16s, caption = "16S Bacterial Faith's Phylogenetic Diversity Summary")
+
+shannon_summary_16s <- div2_16s %>%
+  group_by(Treatment, Timepoint) %>%
+  summarise(
+    n = n(),
+    mean_Shannon = round(mean(Shannon, na.rm = TRUE), 2),
+    sd_Shannon = round(sd(Shannon, na.rm = TRUE), 2),
+    median_Shannon = round(median(Shannon, na.rm = TRUE), 2),
+    se_Shannon = round(sd(Shannon, na.rm = TRUE) / sqrt(n()), 2),
+    ci_lower = round(mean(Shannon, na.rm = TRUE) - (1.96 * se_Shannon), 2),
+    ci_upper = round(mean(Shannon, na.rm = TRUE) + (1.96 * se_Shannon), 2),
+    .groups = 'drop'
+  )
+
+knitr::kable(shannon_summary_16s, caption = "16S Bacterial Shannon Diversity Summary")
+
+simpson_summary_16s <- div2_16s %>%
+  group_by(Treatment, Timepoint) %>%
+  summarise(
+    n = n(),
+    mean_Simpson = round(mean(Simpson, na.rm = TRUE), 3),
+    sd_Simpson = round(sd(Simpson, na.rm = TRUE), 3),
+    median_Simpson = round(median(Simpson, na.rm = TRUE), 3),
+    se_Simpson = round(sd(Simpson, na.rm = TRUE) / sqrt(n()), 3),
+    ci_lower = round(mean(Simpson, na.rm = TRUE) - (1.96 * se_Simpson), 3),
+    ci_upper = round(mean(Simpson, na.rm = TRUE) + (1.96 * se_Simpson), 3),
+    .groups = 'drop'
+  )
+
+knitr::kable(simpson_summary_16s, caption = "16S Bacterial Simpson Diversity Summary")
+
+# Fungal diversity descriptive statistics
+
+pd_summary_its <- div2_its %>%
+  group_by(Treatment, Timepoint) %>%
+  summarise(
+    n = n(),
+    mean_PD = round(mean(PD, na.rm = TRUE), 2),
+    sd_PD = round(sd(PD, na.rm = TRUE), 2),
+    median_PD = round(median(PD, na.rm = TRUE), 2),
+    min_PD = round(min(PD, na.rm = TRUE), 2),
+    max_PD = round(max(PD, na.rm = TRUE), 2),
+    se_PD = round(sd(PD, na.rm = TRUE) / sqrt(n()), 2),
+    ci_lower = round(mean(PD, na.rm = TRUE) - (1.96 * se_PD), 2),
+    ci_upper = round(mean(PD, na.rm = TRUE) + (1.96 * se_PD), 2),
+    .groups = 'drop'
+  )
+
+knitr::kable(pd_summary_its, caption = "ITS Fungal Faith's Phylogenetic Diversity Summary")
+
+shannon_summary_its <- div2_its %>%
+  group_by(Treatment, Timepoint) %>%
+  summarise(
+    n = n(),
+    mean_Shannon = round(mean(Shannon, na.rm = TRUE), 2),
+    sd_Shannon = round(sd(Shannon, na.rm = TRUE), 2),
+    median_Shannon = round(median(Shannon, na.rm = TRUE), 2),
+    se_Shannon = round(sd(Shannon, na.rm = TRUE) / sqrt(n()), 2),
+    ci_lower = round(mean(Shannon, na.rm = TRUE) - (1.96 * se_Shannon), 2),
+    ci_upper = round(mean(Shannon, na.rm = TRUE) + (1.96 * se_Shannon), 2),
+    .groups = 'drop'
+  )
+
+knitr::kable(shannon_summary_its, caption = "ITS Fungal Shannon Diversity Summary")
+
+simpson_summary_its <- div2_its %>%
+  group_by(Treatment, Timepoint) %>%
+  summarise(
+    n = n(),
+    mean_Simpson = round(mean(Simpson, na.rm = TRUE), 3),
+    sd_Simpson = round(sd(Simpson, na.rm = TRUE), 3),
+    median_Simpson = round(median(Simpson, na.rm = TRUE), 3),
+    se_Simpson = round(sd(Simpson, na.rm = TRUE) / sqrt(n()), 3),
+    ci_lower = round(mean(Simpson, na.rm = TRUE) - (1.96 * se_Simpson), 3),
+    ci_upper = round(mean(Simpson, na.rm = TRUE) + (1.96 * se_Simpson), 3),
+    .groups = 'drop'
+  )
+
+knitr::kable(simpson_summary_its, caption = "ITS Fungal Simpson Diversity Summary")
+```
+
+# Session Information
+
+```{r session-info}
+# Document R session for reproducibility
+sessionInfo()
+```
+
+## R Package Citations
+
+```{r package-citations}
+# Generate citations for all packages used (for manuscript references)
+citation("ape")
+citation("dplyr")
+citation("ggplot2")
+citation("tidyr")
+citation("readr")
+citation("phyloseq")
+citation("vegan")
+citation("picante")
+citation("lme4")
+citation("phangorn")
+citation("emmeans")
+citation("lmerTest")
+citation("patchwork")
+```
+
